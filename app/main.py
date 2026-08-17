@@ -3,7 +3,9 @@ import time
 
 from fastapi import FastAPI, Request
 
+from app.circuit import circuit_registry
 from app.config import settings
+from app.events import HealEvent, event_store
 from app.logging_config import configure_logging, log_event
 from app.mock_upstream import router as mock_router
 from app.proxy import router as proxy_router
@@ -32,4 +34,9 @@ async def request_logger(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "candor-gateway"}
+    return {"status": "ok", "service": "candor-gateway", "circuits": circuit_registry.snapshot()}
+
+
+@app.get("/events", response_model=list[HealEvent])
+async def get_events():
+    return event_store.all()
