@@ -7,7 +7,7 @@ import httpx
 from app.config import settings
 from app.logging_config import log_event
 
-logger = logging.getLogger("candor.dispatch")
+logger = logging.getLogger("autoregent.dispatch")
 
 # Headers that must not be blindly forwarded in either direction of a proxy hop.
 HOP_BY_HOP_HEADERS = {

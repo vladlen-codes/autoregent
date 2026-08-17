@@ -11,9 +11,9 @@ from app.mock_upstream import router as mock_router
 from app.proxy import router as proxy_router
 
 configure_logging(settings.log_level)
-logger = logging.getLogger("candor")
+logger = logging.getLogger("autoregent")
 
-app = FastAPI(title="Candor Gateway", version="0.1.0")
+app = FastAPI(title="Autoregent Gateway", version="0.1.0")
 
 app.include_router(mock_router)
 app.include_router(proxy_router)
@@ -34,7 +34,7 @@ async def request_logger(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "candor-gateway", "circuits": circuit_registry.snapshot()}
+    return {"status": "ok", "service": "autoregent-gateway", "circuits": circuit_registry.snapshot()}
 
 
 @app.get("/events", response_model=list[HealEvent])

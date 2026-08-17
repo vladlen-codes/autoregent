@@ -7,14 +7,18 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.circuit import circuit_registry
 from app.config import settings
+from app.diagnosis import DriftDiagnosis
 from app.dispatch import dispatch_upstream
 from app.events import HealEvent, event_store
+from app.gemini_diagnosis import diagnose_drift
+from app.heal_executor import apply_field_mapping, validate_healed_payload
 from app.logging_config import log_event
 from app.route_classifier import RouteClass
 from app.schema_registry import get_expected_schema
+from app.signing import sign_event
 from app.transaction_context import TransactionContext
 
-logger = logging.getLogger("candor.heal")
+logger = logging.getLogger("autoregent.heal")
 
 
 def _parse_json(content: bytes) -> dict | list | None:
@@ -54,20 +58,31 @@ def _extract_fallback_target(content: bytes) -> str | None:
     return target if isinstance(target, str) else None
 
 
-def _record_event(ctx: TransactionContext, outcome: str, original_content: bytes) -> None:
+def _record_event(
+    ctx: TransactionContext,
+    outcome: str,
+    original_content: bytes | dict | list,
+    *,
+    diagnosis: DriftDiagnosis | None = None,
+    healed_payload: dict | None = None,
+) -> HealEvent:
+    original_payload = (
+        original_content if isinstance(original_content, (dict, list)) else _parse_json(original_content)
+    )
     event = HealEvent(
         trace_id=ctx.trace_id,
         timestamp=datetime.now(timezone.utc),
         route=ctx.route,
         route_class=ctx.route_class.value,
         outcome=outcome,
-        original_payload=_parse_json(original_content),
-        healed_payload=None,
-        diagnosis=None,
+        original_payload=original_payload,
+        healed_payload=healed_payload,
+        diagnosis=diagnosis,
         call_stack=list(ctx.call_stack),
         heal_count=ctx.heal_count,
         signature=None,
     )
+    event.signature = sign_event(event)
     event_store.append(event)
     log_event(
         logger, logging.WARNING, "heal_event",
@@ -75,6 +90,7 @@ def _record_event(ctx: TransactionContext, outcome: str, original_content: bytes
         route_class=ctx.route_class.value, heal_count=ctx.heal_count,
         call_stack=list(ctx.call_stack),
     )
+    return event
 
 
 def _loud_response(ctx: TransactionContext, status: int, content: bytes, headers: dict, *, synthesize: bool) -> Response:
@@ -142,7 +158,77 @@ async def handle_informational_failure(
             ctx, result.status_code, result.content, result.headers, is_transport_failure=True,
         )
 
-    # No fallback target to try, and Gemini diagnosis + heal executor land in
-    # Phase 3. Never heal blind: fail loud rather than guess.
-    _record_event(ctx, "failed_loud", content)
-    return _loud_response(ctx, status, content, headers, synthesize=not is_transport_failure)
+    if is_transport_failure:
+        # A real upstream failure (5xx/timeout) -- there's no payload shape to
+        # diagnose or remap, only a genuine error to show.
+        _record_event(ctx, "failed_loud", content)
+        return _loud_response(ctx, status, content, headers, synthesize=False)
+
+    return await _attempt_ai_heal(ctx, status, content, headers)
+
+
+async def _attempt_ai_heal(ctx: TransactionContext, status: int, content: bytes, headers: dict) -> Response:
+    """Gemini can authorise a heal; it can never force one through. Every exit
+    from an uncertain diagnosis is a loud failure."""
+    schema = get_expected_schema(ctx.route)
+    original_payload = _parse_json(content)
+
+    if schema is None or not isinstance(original_payload, dict):
+        _record_event(ctx, "failed_loud", content)
+        return _loud_response(ctx, status, content, headers, synthesize=True)
+
+    validation_error = validate_against_schema(ctx.route, content) or "response diverged from the expected schema"
+
+    diagnosis = await diagnose_drift(ctx.route, schema.model_json_schema(), validation_error, original_payload)
+
+    if diagnosis is None:
+        _record_event(ctx, "failed_loud", original_payload)
+        return _loud_response(ctx, status, content, headers, synthesize=True)
+
+    if (
+        diagnosis.recommendation != "heal"
+        or diagnosis.confidence < settings.gemini_confidence_threshold
+        or diagnosis.drift_type == "unrecoverable"
+    ):
+        log_event(
+            logger, logging.INFO, "heal_declined",
+            route=ctx.route, recommendation=diagnosis.recommendation,
+            confidence=diagnosis.confidence, drift_type=diagnosis.drift_type,
+        )
+        _record_event(ctx, "failed_loud", original_payload, diagnosis=diagnosis)
+        return _loud_response(ctx, status, content, headers, synthesize=True)
+
+    healed_payload = apply_field_mapping(diagnosis.field_mapping, original_payload)
+    if healed_payload is None:
+        log_event(logger, logging.WARNING, "heal_executor_missing_source", route=ctx.route)
+        _record_event(ctx, "failed_loud", original_payload, diagnosis=diagnosis)
+        return _loud_response(ctx, status, content, headers, synthesize=True)
+
+    gate_error = validate_healed_payload(schema, healed_payload)
+    if gate_error is not None:
+        log_event(logger, logging.ERROR, "validation_gate_blocked", route=ctx.route, detail=gate_error)
+        _record_event(ctx, "failed_loud", original_payload, diagnosis=diagnosis)
+        return _loud_response(ctx, status, content, headers, synthesize=True)
+
+    event = _record_event(ctx, "healed", original_payload, diagnosis=diagnosis, healed_payload=healed_payload)
+    log_event(
+        logger, logging.ERROR, "divergence_alert",
+        trace_id=ctx.trace_id, route=ctx.route, drift_type=diagnosis.drift_type,
+        confidence=diagnosis.confidence, signature=event.signature,
+    )
+    response_headers = {
+        "content-type": "application/json",
+        "X-Autoregent-Healed": "true",
+        "X-Autoregent-Trace-Id": ctx.trace_id,
+        "X-Autoregent-Drift-Type": diagnosis.drift_type,
+        "X-Autoregent-Confidence": str(diagnosis.confidence),
+        "X-Autoregent-Signature": event.signature,
+    }
+    if ctx.idempotency_key:
+        response_headers["Idempotency-Key"] = ctx.idempotency_key
+    return Response(
+        content=json.dumps(healed_payload).encode(),
+        status_code=200,
+        headers=response_headers,
+        media_type="application/json",
+    )

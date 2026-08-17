@@ -14,7 +14,7 @@ from app.logging_config import log_event
 from app.route_classifier import RouteClass, classify_route
 from app.transaction_context import TransactionContext
 
-logger = logging.getLogger("candor.proxy")
+logger = logging.getLogger("autoregent.proxy")
 router = APIRouter()
 
 
