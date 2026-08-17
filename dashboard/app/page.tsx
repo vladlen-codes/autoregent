@@ -4,12 +4,18 @@ import { useEffect, useRef, useState } from "react";
 import { CircuitGrid } from "./components/CircuitGrid";
 import { DivergenceBanner } from "./components/DivergenceBanner";
 import { EventFeed } from "./components/EventFeed";
+import { StatsCharts } from "./components/StatsCharts";
 import type { HealEvent, HealthResponse } from "./types";
 
-const DEFAULT_API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://autoregent-production.up.railway.app";
+const LIVE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://autoregent-production.up.railway.app";
+const LOCAL_URL = "http://localhost:8000";
+const DEFAULT_API_BASE_URL = LIVE_URL;
 
 const POLL_INTERVAL_MS = 4000;
+
+function isValidBaseUrl(value: string): boolean {
+  return /^https?:\/\/[^\s]+$/.test(value.trim()) && !value.includes(" ");
+}
 
 function useApiBaseUrl() {
   const [url, setUrl] = useState(DEFAULT_API_BASE_URL);
@@ -53,7 +59,12 @@ export default function DashboardPage() {
   const previousHealedTraceId = useRef<string | null>(null);
   const hasLoadedOnce = useRef(false);
 
+  const [paused, setPaused] = useState(false);
+  const [urlError, setUrlError] = useState<string | null>(null);
+  const [manualRefreshTick, setManualRefreshTick] = useState(0);
+
   useEffect(() => {
+    if (paused) return;
     let cancelled = false;
 
     async function poll() {
@@ -95,7 +106,18 @@ export default function DashboardPage() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [apiBaseUrl]);
+  }, [apiBaseUrl, paused, manualRefreshTick]);
+
+  function applyUrl(next: string) {
+    const trimmed = next.trim();
+    if (!isValidBaseUrl(trimmed)) {
+      setUrlError("must start with http:// or https://, no spaces");
+      return;
+    }
+    setUrlError(null);
+    setApiBaseUrl(trimmed);
+    setUrlDraft(trimmed);
+  }
 
   const reversedEvents = [...events].reverse();
 
@@ -109,47 +131,99 @@ export default function DashboardPage() {
               Every heal is a disclosure event, not a success.
             </p>
           </div>
-          <div className="flex items-center gap-2 text-xs text-neutral-500">
-            <span
-              className={`inline-block h-2 w-2 rounded-full ${
-                status === "ok"
-                  ? "bg-emerald-500"
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 text-xs text-neutral-500">
+              <span
+                className={`inline-block h-2 w-2 rounded-full ${
+                  status === "ok"
+                    ? "bg-emerald-500"
+                    : status === "error"
+                      ? "bg-rose-500"
+                      : "bg-amber-500 animate-pulse"
+                }`}
+              />
+              <span>
+                {status === "ok" && lastUpdated
+                  ? `updated ${lastUpdated.toLocaleTimeString()}`
                   : status === "error"
-                    ? "bg-rose-500"
-                    : "bg-amber-500 animate-pulse"
+                    ? "connection failed"
+                    : "connecting..."}
+              </span>
+            </div>
+            <button
+              onClick={() => setManualRefreshTick((t) => t + 1)}
+              className="rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 transition-colors"
+              title="Poll immediately instead of waiting for the next 4s tick"
+            >
+              Refresh
+            </button>
+            <button
+              onClick={() => setPaused((p) => !p)}
+              className={`rounded-md border px-2 py-1 text-xs transition-colors ${
+                paused
+                  ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                  : "border-neutral-800 bg-neutral-900 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200"
               }`}
-            />
-            <span>
-              {status === "ok" && lastUpdated
-                ? `updated ${lastUpdated.toLocaleTimeString()}`
-                : status === "error"
-                  ? "connection failed"
-                  : "connecting..."}
-            </span>
+              title="Freeze the dashboard -- handy mid-demo when you want the screen to hold still"
+            >
+              {paused ? "Paused" : "Live"}
+            </button>
           </div>
         </div>
 
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            setApiBaseUrl(urlDraft);
-          }}
-          className="flex items-center gap-2"
-        >
-          <label className="text-xs text-neutral-500 shrink-0">Gateway URL</label>
-          <input
-            value={urlDraft}
-            onChange={(e) => setUrlDraft(e.target.value)}
-            className="flex-1 min-w-0 rounded-md border border-neutral-800 bg-neutral-900 px-2.5 py-1 text-xs font-mono text-neutral-300 focus:outline-none focus:border-neutral-600"
-            spellCheck={false}
-          />
-          <button
-            type="submit"
-            className="rounded-md border border-neutral-800 bg-neutral-900 px-2.5 py-1 text-xs text-neutral-300 hover:bg-neutral-800 transition-colors shrink-0"
-          >
-            Set
-          </button>
-        </form>
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2 flex-wrap">
+            <label className="text-xs text-neutral-500 shrink-0">Gateway</label>
+            <button
+              onClick={() => applyUrl(LOCAL_URL)}
+              className={`rounded-full px-2.5 py-0.5 text-xs border transition-colors ${
+                apiBaseUrl === LOCAL_URL
+                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-300"
+                  : "border-neutral-800 bg-neutral-900 text-neutral-400 hover:bg-neutral-800"
+              }`}
+            >
+              Local :8000
+            </button>
+            <button
+              onClick={() => applyUrl(LIVE_URL)}
+              className={`rounded-full px-2.5 py-0.5 text-xs border transition-colors ${
+                apiBaseUrl === LIVE_URL
+                  ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-300"
+                  : "border-neutral-800 bg-neutral-900 text-neutral-400 hover:bg-neutral-800"
+              }`}
+            >
+              Live (Railway)
+            </button>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                applyUrl(urlDraft);
+              }}
+              className="flex items-center gap-2 flex-1 min-w-56"
+            >
+              <input
+                value={urlDraft}
+                onChange={(e) => {
+                  setUrlDraft(e.target.value);
+                  if (urlError) setUrlError(null);
+                }}
+                placeholder="or type a custom URL..."
+                className={`flex-1 min-w-0 rounded-md border bg-neutral-900 px-2.5 py-1 text-xs font-mono text-neutral-300 focus:outline-none ${
+                  urlError ? "border-rose-500/60" : "border-neutral-800 focus:border-neutral-600"
+                }`}
+                spellCheck={false}
+              />
+              <button
+                type="submit"
+                className="rounded-md border border-neutral-800 bg-neutral-900 px-2.5 py-1 text-xs text-neutral-300 hover:bg-neutral-800 transition-colors shrink-0"
+              >
+                Set
+              </button>
+            </form>
+          </div>
+          {urlError && <div className="text-[11px] text-rose-400">{urlError}</div>}
+          <div className="text-[11px] text-neutral-600 font-mono">active: {apiBaseUrl}</div>
+        </div>
       </header>
 
       <section className="flex flex-col gap-2">
@@ -163,9 +237,14 @@ export default function DashboardPage() {
       </section>
 
       <section className="flex flex-col gap-2">
+        <h2 className="text-xs uppercase tracking-wide text-neutral-500">Stats</h2>
+        <StatsCharts events={events} />
+      </section>
+
+      <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
           <h2 className="text-xs uppercase tracking-wide text-neutral-500">
-            Event log ({events.length})
+            Event log ({events.length}) -- click a row for the pipeline breakdown
           </h2>
         </div>
         <EventFeed events={reversedEvents} />

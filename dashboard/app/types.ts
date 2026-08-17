@@ -2,6 +2,19 @@ export type RouteClass = "TRANSACTIONAL" | "INFORMATIONAL";
 
 export type Outcome = "healed" | "failed_loud" | "loop_suppressed" | "budget_exhausted";
 
+export type FailureReason =
+  | "circuit_open_precheck"
+  | "transactional_short_circuit"
+  | "loop_detected"
+  | "budget_exhausted_transaction"
+  | "budget_exhausted_window"
+  | "transport_failure_no_diagnosis"
+  | "gemini_unavailable"
+  | "gemini_declined"
+  | "heal_executor_missing_source"
+  | "validation_gate_blocked"
+  | "no_expected_schema";
+
 export type DriftType =
   | "field_rename"
   | "type_change"
@@ -23,6 +36,8 @@ export interface HealEvent {
   route: string;
   route_class: RouteClass;
   outcome: Outcome;
+  failure_reason: FailureReason | null;
+  is_transport_failure: boolean;
   original_payload: Record<string, unknown> | unknown[] | null;
   healed_payload: Record<string, unknown> | null;
   diagnosis: DriftDiagnosis | null;

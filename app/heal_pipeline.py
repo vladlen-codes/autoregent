@@ -63,6 +63,8 @@ def _record_event(
     outcome: str,
     original_content: bytes | dict | list,
     *,
+    failure_reason: str | None = None,
+    is_transport_failure: bool = False,
     diagnosis: DriftDiagnosis | None = None,
     healed_payload: dict | None = None,
 ) -> HealEvent:
@@ -75,6 +77,8 @@ def _record_event(
         route=ctx.route,
         route_class=ctx.route_class.value,
         outcome=outcome,
+        failure_reason=failure_reason,
+        is_transport_failure=is_transport_failure,
         original_payload=original_payload,
         healed_payload=healed_payload,
         diagnosis=diagnosis,
@@ -116,7 +120,7 @@ def _loud_response(ctx: TransactionContext, status: int, content: bytes, headers
 
 async def handle_circuit_open(ctx: TransactionContext) -> Response:
     outcome = "budget_exhausted" if ctx.route_class == RouteClass.INFORMATIONAL else "failed_loud"
-    _record_event(ctx, outcome, b"")
+    _record_event(ctx, outcome, b"", failure_reason="circuit_open_precheck", is_transport_failure=True)
     headers = {"content-type": "application/json"}
     if ctx.idempotency_key:
         headers["Idempotency-Key"] = ctx.idempotency_key
@@ -128,7 +132,10 @@ async def handle_transactional_failure(ctx: TransactionContext, status: int, con
     """TRD 3.1: short-circuits the entire heal pipeline. No loop detector, no
     budget check, no diagnosis -- one strike trips the circuit."""
     circuit_registry.get(ctx.route).trip()
-    _record_event(ctx, "failed_loud", content)
+    _record_event(
+        ctx, "failed_loud", content,
+        failure_reason="transactional_short_circuit", is_transport_failure=True,
+    )
     return _loud_response(ctx, status, content, headers, synthesize=False)
 
 
@@ -139,12 +146,20 @@ async def handle_informational_failure(
 
     fallback_target = _extract_fallback_target(content)
     if fallback_target is not None and not ctx.push(fallback_target):
-        _record_event(ctx, "loop_suppressed", content)
+        _record_event(
+            ctx, "loop_suppressed", content,
+            failure_reason="loop_detected", is_transport_failure=is_transport_failure,
+        )
         return _loud_response(ctx, status, content, headers, synthesize=not is_transport_failure)
 
-    if ctx.heal_count >= settings.max_heals_per_transaction or circuit.is_window_exhausted():
+    transaction_exhausted = ctx.heal_count >= settings.max_heals_per_transaction
+    if transaction_exhausted or circuit.is_window_exhausted():
         circuit.trip()
-        _record_event(ctx, "budget_exhausted", content)
+        reason = "budget_exhausted_transaction" if transaction_exhausted else "budget_exhausted_window"
+        _record_event(
+            ctx, "budget_exhausted", content,
+            failure_reason=reason, is_transport_failure=is_transport_failure,
+        )
         return _loud_response(ctx, status, content, headers, synthesize=not is_transport_failure)
 
     ctx.heal_count += 1
@@ -161,7 +176,10 @@ async def handle_informational_failure(
     if is_transport_failure:
         # A real upstream failure (5xx/timeout) -- there's no payload shape to
         # diagnose or remap, only a genuine error to show.
-        _record_event(ctx, "failed_loud", content)
+        _record_event(
+            ctx, "failed_loud", content,
+            failure_reason="transport_failure_no_diagnosis", is_transport_failure=True,
+        )
         return _loud_response(ctx, status, content, headers, synthesize=False)
 
     return await _attempt_ai_heal(ctx, status, content, headers)
@@ -174,7 +192,7 @@ async def _attempt_ai_heal(ctx: TransactionContext, status: int, content: bytes,
     original_payload = _parse_json(content)
 
     if schema is None or not isinstance(original_payload, dict):
-        _record_event(ctx, "failed_loud", content)
+        _record_event(ctx, "failed_loud", content, failure_reason="no_expected_schema")
         return _loud_response(ctx, status, content, headers, synthesize=True)
 
     validation_error = validate_against_schema(ctx.route, content) or "response diverged from the expected schema"
@@ -182,7 +200,7 @@ async def _attempt_ai_heal(ctx: TransactionContext, status: int, content: bytes,
     diagnosis = await diagnose_drift(ctx.route, schema.model_json_schema(), validation_error, original_payload)
 
     if diagnosis is None:
-        _record_event(ctx, "failed_loud", original_payload)
+        _record_event(ctx, "failed_loud", original_payload, failure_reason="gemini_unavailable")
         return _loud_response(ctx, status, content, headers, synthesize=True)
 
     if (
@@ -195,19 +213,25 @@ async def _attempt_ai_heal(ctx: TransactionContext, status: int, content: bytes,
             route=ctx.route, recommendation=diagnosis.recommendation,
             confidence=diagnosis.confidence, drift_type=diagnosis.drift_type,
         )
-        _record_event(ctx, "failed_loud", original_payload, diagnosis=diagnosis)
+        _record_event(ctx, "failed_loud", original_payload, failure_reason="gemini_declined", diagnosis=diagnosis)
         return _loud_response(ctx, status, content, headers, synthesize=True)
 
     healed_payload = apply_field_mapping(diagnosis.field_mapping, original_payload)
     if healed_payload is None:
         log_event(logger, logging.WARNING, "heal_executor_missing_source", route=ctx.route)
-        _record_event(ctx, "failed_loud", original_payload, diagnosis=diagnosis)
+        _record_event(
+            ctx, "failed_loud", original_payload,
+            failure_reason="heal_executor_missing_source", diagnosis=diagnosis,
+        )
         return _loud_response(ctx, status, content, headers, synthesize=True)
 
     gate_error = validate_healed_payload(schema, healed_payload)
     if gate_error is not None:
         log_event(logger, logging.ERROR, "validation_gate_blocked", route=ctx.route, detail=gate_error)
-        _record_event(ctx, "failed_loud", original_payload, diagnosis=diagnosis)
+        _record_event(
+            ctx, "failed_loud", original_payload,
+            failure_reason="validation_gate_blocked", diagnosis=diagnosis,
+        )
         return _loud_response(ctx, status, content, headers, synthesize=True)
 
     event = _record_event(ctx, "healed", original_payload, diagnosis=diagnosis, healed_payload=healed_payload)
