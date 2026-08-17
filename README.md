@@ -10,6 +10,7 @@ An API gateway that heals failing upstreams but is structurally incapable of doi
 
 **Live gateway:** https://autoregent-production.up.railway.app
 **Live dashboard:** https://vladlen-codes.github.io/autoregent/
+**Docs:** [DOCUMENTATION.md](DOCUMENTATION.md)
 
 ---
 
