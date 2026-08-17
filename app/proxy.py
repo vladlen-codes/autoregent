@@ -1,76 +1,65 @@
 import logging
-import time
 
-import httpx
 from fastapi import APIRouter, Request, Response
 
-from app.config import settings
+from app.circuit import CircuitState, circuit_registry
+from app.dispatch import dispatch_upstream
+from app.heal_pipeline import (
+    handle_circuit_open,
+    handle_informational_failure,
+    handle_transactional_failure,
+    validate_against_schema,
+)
 from app.logging_config import log_event
+from app.route_classifier import RouteClass, classify_route
+from app.transaction_context import TransactionContext
 
 logger = logging.getLogger("candor.proxy")
 router = APIRouter()
 
-# Headers that must not be blindly forwarded in either direction of a proxy hop.
-HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-    "host",
-}
-
-
-def _filter_headers(headers) -> dict:
-    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
-
 
 @router.api_route("/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(path: str, request: Request):
-    """Phase 1: straight passthrough. No healing, no classification yet."""
-    target_url = f"{settings.upstream_base_url}/{path}"
-    body = await request.body()
-    forward_headers = _filter_headers(request.headers)
-
-    start = time.monotonic()
-    try:
-        async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds) as client:
-            upstream_response = await client.request(
-                request.method,
-                target_url,
-                content=body,
-                headers=forward_headers,
-                params=request.query_params,
-            )
-    except httpx.TimeoutException:
-        duration_ms = round((time.monotonic() - start) * 1000, 1)
-        log_event(logger, logging.WARNING, "upstream_timeout", target=target_url, duration_ms=duration_ms)
-        return Response(
-            content=b'{"error":"upstream_timeout"}', status_code=504, media_type="application/json"
-        )
-    except httpx.HTTPError as exc:
-        duration_ms = round((time.monotonic() - start) * 1000, 1)
-        log_event(
-            logger, logging.ERROR, "upstream_unreachable",
-            target=target_url, error=str(exc), duration_ms=duration_ms,
-        )
-        return Response(
-            content=b'{"error":"upstream_unreachable"}', status_code=502, media_type="application/json"
-        )
-
-    duration_ms = round((time.monotonic() - start) * 1000, 1)
-    log_event(
-        logger, logging.INFO, "proxy_dispatch",
-        target=target_url, status_code=upstream_response.status_code, duration_ms=duration_ms,
+    route_class = classify_route(path)
+    ctx = TransactionContext(
+        route=path,
+        route_class=route_class,
+        idempotency_key=request.headers.get("idempotency-key"),
     )
+    circuit = circuit_registry.get(path)
 
-    return Response(
-        content=upstream_response.content,
-        status_code=upstream_response.status_code,
-        headers=_filter_headers(upstream_response.headers),
-        media_type=upstream_response.headers.get("content-type"),
+    if not circuit.allow_request():
+        return await handle_circuit_open(ctx)
+
+    was_half_open = circuit.state == CircuitState.HALF_OPEN
+
+    ctx.push(path)
+    body = await request.body()
+    result = await dispatch_upstream(path, request.method, dict(request.headers), body, request.query_params)
+
+    if result.ok:
+        drift = validate_against_schema(path, result.content) if route_class == RouteClass.INFORMATIONAL else None
+
+        if drift is None:
+            # Genuinely clean: only this counts as probe success. A 200 with
+            # drifted content must NOT close the circuit early.
+            if was_half_open:
+                circuit.record_probe_result(success=True)
+            return Response(content=result.content, status_code=result.status_code, headers=result.headers)
+
+        if was_half_open:
+            circuit.record_probe_result(success=False)
+        log_event(logger, logging.WARNING, "schema_drift_detected", route=path, detail=drift)
+        return await handle_informational_failure(
+            ctx, result.status_code, result.content, result.headers, is_transport_failure=False,
+        )
+
+    if was_half_open:
+        circuit.record_probe_result(success=False)
+
+    if route_class == RouteClass.TRANSACTIONAL:
+        return await handle_transactional_failure(ctx, result.status_code, result.content, result.headers)
+
+    return await handle_informational_failure(
+        ctx, result.status_code, result.content, result.headers, is_transport_failure=True,
     )

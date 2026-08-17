@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-router = APIRouter(prefix="/mock", tags=["mock-upstream"])
+router = APIRouter(tags=["mock-upstream"])
 
 SCENARIOS = {"healthy", "field_rename", "type_change", "timeout", "500", "cascading"}
 
@@ -22,17 +22,13 @@ def _base_payload() -> dict:
     }
 
 
-@router.api_route("/{scenario}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def mock_upstream(scenario: str, request: Request):
-    if scenario not in SCENARIOS:
-        return JSONResponse(status_code=404, content={"error": f"unknown_scenario:{scenario}"})
-
+async def _render_scenario(scenario: str, fallback_target: str) -> tuple[int, dict]:
     if scenario == "healthy":
-        return _base_payload()
+        return 200, _base_payload()
 
     if scenario == "field_rename":
         payload = _base_payload()
-        return {
+        return 200, {
             "id": payload["account_id"],
             "current_balance": payload["balance"],
             "currency": payload["currency"],
@@ -42,19 +38,35 @@ async def mock_upstream(scenario: str, request: Request):
     if scenario == "type_change":
         payload = _base_payload()
         payload["balance"] = str(payload["balance"])
-        return payload
+        return 200, payload
 
     if scenario == "timeout":
         await asyncio.sleep(TIMEOUT_SLEEP_SECONDS)
-        return _base_payload()
+        return 200, _base_payload()
 
     if scenario == "500":
-        return JSONResponse(status_code=500, content={"error": "upstream_internal_error"})
+        return 500, {"error": "upstream_internal_error"}
 
     # cascading: the primary fails, and its declared fallback target fails too.
-    # Phase 2's loop detector uses this to demonstrate suppression instead of
-    # an infinite retry chain.
-    return JSONResponse(
-        status_code=502,
-        content={"error": "upstream_unavailable", "fallback_target": "mock/cascading"},
-    )
+    # The gateway's loop detector uses this to demonstrate suppression instead
+    # of an infinite retry chain.
+    return 502, {"error": "upstream_unavailable", "fallback_target": fallback_target}
+
+
+@router.api_route("/mock/{scenario}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def mock_upstream(scenario: str, request: Request):
+    if scenario not in SCENARIOS:
+        return JSONResponse(status_code=404, content={"error": f"unknown_scenario:{scenario}"})
+    status, content = await _render_scenario(scenario, fallback_target="mock/cascading")
+    return JSONResponse(status_code=status, content=content)
+
+
+@router.api_route("/mock/txn/{scenario}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def mock_txn_upstream(scenario: str, request: Request):
+    """Same upstream behaviour, mounted where the route classifier tags the
+    proxied path TRANSACTIONAL -- demonstrates that identical upstream drift
+    is healed on an informational route but always fails loud here."""
+    if scenario not in SCENARIOS:
+        return JSONResponse(status_code=404, content={"error": f"unknown_scenario:{scenario}"})
+    status, content = await _render_scenario(scenario, fallback_target="mock/txn/cascading")
+    return JSONResponse(status_code=status, content=content)

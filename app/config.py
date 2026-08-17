@@ -9,5 +9,10 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     log_level: str = "INFO"
 
+    max_heals_per_transaction: int = 2
+    rolling_window_seconds: float = 60.0
+    rolling_window_max_heals: int = 5
+    circuit_cooldown_seconds: float = 30.0
+
 
 settings = Settings()
