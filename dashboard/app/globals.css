@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+/* This dashboard is dark-only by design -- no light theme exists anywhere in
+   the component styling. create-next-app's default light/dark `body {}` rule
+   is plain (unlayered) CSS, which under Tailwind v4's cascade-layer rules
+   beats ANY Tailwind utility class regardless of specificity -- so it was
+   silently overriding bg-neutral-950/text-neutral-100 on <body> whenever
+   prefers-color-scheme didn't match dark, leaving light-grey "dark theme"
+   text nearly invisible against a background that had reverted to white. */
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@keyframes divergence-flash {
+  0% {
+    background-color: rgba(245, 158, 11, 0.35);
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.6);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
+.flash-once {
+  animation: divergence-flash 2.2s ease-out;
+}
